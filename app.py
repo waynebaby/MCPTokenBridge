@@ -13,12 +13,41 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import threading
+from dataclasses import dataclass, field
+from queue import Queue
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
+
+# 本地精简版 fastmcp 框架 / lightweight fastmcp-inspired harness
+# 只负责 STDIN/STDOUT JSON-RPC 循环，保持与用户要求一致。
+
+
+class StdioMCPServer:
+    """Minimal STDIN/STDOUT server inspired by fastmcp / 精简版 fastmcp 服务."""
+
+    def __init__(self, handler: "MCPTokenBridge") -> None:
+        self.handler = handler
+
+    def serve_forever(self) -> None:
+        for line in sys.stdin:
+            payload = line.strip()
+            if not payload:
+                continue
+            try:
+                message = json.loads(payload)
+                reply = self.handler.handle_mcp_call(message)
+            except json.JSONDecodeError:
+                reply = MCPResponse(
+                    id=None,
+                    result={},
+                    error={"code": -32700, "message": "Invalid JSON"},
+                )
+            sys.stdout.write(reply.to_json() + "\n")
+            sys.stdout.flush()
 
 
 # --------------------------
@@ -69,6 +98,17 @@ class MCPResponse:
         return json.dumps(payload, ensure_ascii=False)
 
 
+@dataclass
+class PendingHttpCall:
+    """Pending HTTP call waiting for hook / 待处理 HTTP 请求."""
+
+    request: ChatCompletionRequest
+    event: threading.Event = field(default_factory=threading.Event)
+    response: Optional[ChatCompletionResponse] = None
+    headers: Dict[str, str] = field(default_factory=dict)
+    error: Optional[str] = None
+
+
 # --------------------------------
 # Core bridge logic / 核心桥接逻辑
 # --------------------------------
@@ -83,6 +123,13 @@ class MCPTokenBridge:
 
     def __init__(self, model_name: str = "mcp-bridge-demo") -> None:
         self.model_name = model_name
+        self._requests: "Queue[PendingHttpCall]" = Queue()
+        self._hook_thread = threading.Thread(
+            target=self._hook_worker,
+            name="hook-worker",
+            daemon=True,
+        )
+        self._hook_thread.start()
 
     def _generate_reply(self, messages: List[ChatMessage]) -> str:
         """Generate a simple echo-style reply.
@@ -93,6 +140,40 @@ class MCPTokenBridge:
         if not messages:
             return "Hello from MCPTokenBridge!"
         return f"Echo: {messages[-1].content}"
+
+    def _hook_worker(self) -> None:
+        """Dedicated hook thread to process HTTP requests / 固定 Hook 线程轮询队列."""
+
+        while True:
+            pending = self._requests.get()
+            try:
+                completion = self.chat_completion(pending.request)
+                pending.response = completion
+                pending.headers.update(
+                    {
+                        "X-MCP-Bridge": "hook",
+                        "X-MCP-Model": completion.model,
+                    }
+                )
+            except Exception as exc:  # keep thread alive
+                pending.error = f"Hook failure 钩子错误: {exc}"
+            finally:
+                pending.event.set()
+
+    def submit_chat_request(self, request: ChatCompletionRequest, timeout: float = 30.0) -> Tuple[ChatCompletionResponse, Dict[str, str]]:
+        """Queue a chat completion for the hook worker and wait for result.
+
+        将请求送入 Hook 队列并阻塞等待返回，避免阻塞其他 HTTP 请求。
+        """
+
+        pending = PendingHttpCall(request=request)
+        self._requests.put(pending)
+        if not pending.event.wait(timeout=timeout):
+            raise TimeoutError("Hook response timed out 钩子响应超时")
+        if pending.error:
+            raise RuntimeError(pending.error)
+        assert pending.response is not None
+        return pending.response, pending.headers
 
     def chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         reply_text = self._generate_reply(request.messages)
@@ -158,8 +239,11 @@ class MCPTokenBridge:
                     },
                 )
 
-            completion = self.chat_completion(request)
-            return MCPResponse(id=message_id, result=completion.model_dump())
+            # 通过 Hook 线程队列处理，确保工具永不结束 / route through hook queue
+            completion, headers = self.submit_chat_request(request)
+            result_payload = completion.model_dump()
+            result_payload["_headers"] = headers  # expose headers back to caller
+            return MCPResponse(id=message_id, result=result_payload)
 
         return MCPResponse(
             id=message_id,
@@ -180,8 +264,13 @@ bridge = MCPTokenBridge()
 async def chat_completions_endpoint(request: ChatCompletionRequest) -> JSONResponse:
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming not supported in demo")
-    response = bridge.chat_completion(request)
-    return JSONResponse(status_code=200, content=response.model_dump())
+    try:
+        response, headers = bridge.submit_chat_request(request)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return JSONResponse(status_code=200, content=response.model_dump(), headers=headers)
 
 
 # ------------------------
@@ -190,35 +279,45 @@ async def chat_completions_endpoint(request: ChatCompletionRequest) -> JSONRespo
 
 
 def run_stdio_loop() -> None:
-    """Run a simple MCP stdin loop / 运行 MCP stdin 循环。"""
+    """Run a simple MCP stdin loop / 运行 MCP stdin 循环。
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-            reply = bridge.handle_mcp_call(payload)
-        except json.JSONDecodeError:
-            reply = MCPResponse(id=None, result={}, error={"code": -32700, "message": "Invalid JSON"})
-        sys.stdout.write(reply.to_json() + "\n")
-        sys.stdout.flush()
+    单一入口：启动本进程后即监听 STDIN 并提供 MCP JSON-RPC 服务，
+    同时通过后台线程运行 HTTP 服务器。
+    """
+
+    StdioMCPServer(bridge).serve_forever()
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="MCPTokenBridge entrypoint")
-    parser.add_argument("--host", default="0.0.0.0", help="HTTP host")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help=(
+            "HTTP bind address; use 0.0.0.0 to expose all adapters or a specific IP "
+            "(e.g., 192.168.55.10) to limit access / HTTP 绑定地址；使用 0.0.0.0 暴露"
+            "全部网卡，指定具体 IP（如 192.168.55.10）可限制访问。"
+        ),
+    )
     parser.add_argument("--port", type=int, default=8000, help="HTTP port")
-    parser.add_argument("--stdio", action="store_true", help="Run MCP stdin loop only")
     args = parser.parse_args(argv)
 
-    if args.stdio:
-        run_stdio_loop()
-        return
-
+    # 启动 HTTP 服务线程 / Start HTTP server thread
     import uvicorn
 
-    uvicorn.run("app:app", host=args.host, port=args.port, reload=False)
+    server_config = uvicorn.Config("app:app", host=args.host, port=args.port, reload=False, lifespan="on")
+    server = uvicorn.Server(server_config)
+
+    http_thread = threading.Thread(target=server.run, name="uvicorn-thread", daemon=True)
+    http_thread.start()
+
+    # 主线程运行 MCP STDIN 循环 / MCP loop on main thread
+    run_stdio_loop()
+
+    # 如果 STDIN 结束，确保 HTTP 线程退出 / Graceful stop when stdin ends
+    if server.should_exit is False:
+        server.should_exit = True
+    http_thread.join(timeout=1)
 
 
 if __name__ == "__main__":
