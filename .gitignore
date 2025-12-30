@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+bin/*
+!bin/.gitkeep
+logs/*
+!logs/.gitkeep
+*.pyc
+*.pyo
+*.coverage
+.cache/
