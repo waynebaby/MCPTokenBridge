@@ -15,9 +15,9 @@ pip install -r requirements.txt
 
 ## Run: single entry (HTTP + MCP) / 运行方式：单一入口（HTTP + MCP）
 ```bash
-python app.py --host 0.0.0.0 --port 8000
+python mcptb.py --host 0.0.0.0 --port 8000
 # MCP stdin is handled on the same process; for example:
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | python app.py --host 0.0.0.0 --port 8000
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | python mcptb.py --host 0.0.0.0 --port 8000
 ```
 
 ## Network binding guidance / 网络绑定说明
@@ -33,7 +33,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | python app.py --host 0.0
 2. `hook` 工具常驻后台线程，不会结束，同时返回 MCP 相关的响应头与聊天内容。
 
 ## Project Layout / 目录结构
-- `app.py` — single runtime module for both HTTP and MCP modes / 兼作 HTTP 与 MCP 入口的单文件模块
+- `mcptb.py` — single runtime module for both HTTP and MCP modes / 兼作 HTTP 与 MCP 入口的单文件模块
 - `requirements.txt` — dependencies / 依赖声明
 - `tests/` — pytest suite / 单元测试
 - `logs/`, `bin/` — outputs and helper scripts / 输出与辅助脚本
@@ -45,7 +45,7 @@ Place `mcp.json` under `.vscode/` (or your global MCP directory) so Copilot Chat
   "mcpServers": {
     "mcp-token-bridge": {
       "command": "python",
-      "args": ["app.py", "--host", "127.0.0.1", "--port", "8000"],
+      "args": ["mcptb.py", "--host", "127.0.0.1", "--port", "8000"],
       "env": {},
       "enabled": true
     }
@@ -62,7 +62,7 @@ Place `mcp.json` under `.vscode/` (or your global MCP directory) so Copilot Chat
   "mcpServers": {
     "mcp-token-bridge": {
       "command": "python",
-      "args": ["app.py", "--host", "127.0.0.1", "--port", "8000"],
+      "args": ["mcptb.py", "--host", "127.0.0.1", "--port", "8000"],
       "env": {},
       "enabled": true
     }

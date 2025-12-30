@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import ChatCompletionRequest, MCPTokenBridge, chat_completions_endpoint
+from mcptb import ChatCompletionRequest, MCPTokenBridge, chat_completions_endpoint
 
 
 def test_chat_completion_endpoint_echoes_last_message() -> None:
