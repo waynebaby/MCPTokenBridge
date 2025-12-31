@@ -27,12 +27,12 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | python mcptb.py --host 0
 ## Flow (English)
 1. HTTP `POST /v1/chat/completions` enqueues the request and waits for the `hook` worker reply.
 2. The `hook` tool never terminates; it runs on a fixed background thread and returns MCP headers along with the chat response.
-3. **Streaming support** (new): Set `"stream": true` in the request to receive Server-Sent Events (SSE) formatted responses with `Content-Type: text/event-stream`. Chunks are sent character-by-character in the format `data: {json}\n\n` followed by a final `data: [DONE]\n\n`.
+3. **Streaming disabled**: All `stream=true` requests are handled as non-stream JSON responses.
 
 ## 工作流（中文）
 1. HTTP `POST /v1/chat/completions` 会将请求入队，等待 `hook` 工作者返回结果。
 2. `hook` 工具常驻后台线程，不会结束，同时返回 MCP 相关的响应头与聊天内容。
-3. **流式支持**（新功能）：在请求中设置 `"stream": true` 可以接收 Server-Sent Events (SSE) 格式的响应，Content-Type 为 `text/event-stream`。每个块按字符逐个发送，格式为 `data: {json}\n\n`，最后以 `data: [DONE]\n\n` 结束。
+3. **流式关闭**：所有 `stream=true` 请求均以非流式 JSON 响应返回。
 
 ## Project Layout / 目录结构
 - `mcptb.py` — single runtime module for both HTTP and MCP modes / 兼作 HTTP 与 MCP 入口的单文件模块
@@ -40,7 +40,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | python mcptb.py --host 0
 - `tests/` — pytest suite / 单元测试
 - `logs/`, `bin/` — outputs and helper scripts / 输出与辅助脚本
 
-## Streaming API Usage Example / 流式 API 使用示例
+## Endpoints & Examples / 接口与示例
 
 ### Non-streaming request (traditional) / 非流式请求（传统）
 ```bash
@@ -54,21 +54,6 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 # Response: {"id":"mcp-fastmcp-response","model":"mcp-bridge-demo","object":"chat.completion",...}
 ```
 
-### Streaming request with SSE / 流式请求（SSE）
-```bash
-curl -X POST http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "mcp-bridge-demo",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "stream": true
-  }'
-# Response stream:
-# data: {"id":"mcp-stream-0","model":"mcp-bridge-demo","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"H"}}]}
-# data: {"id":"mcp-stream-1","model":"mcp-bridge-demo","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"e"}}]}
-# ... (more chunks) ...
-# data: [DONE]
-```
 
 ## VS Code MCP configuration (English)
 Place `mcp.json` under `.vscode/` (or your global MCP directory) so Copilot Chat launches the combined entrypoint and keeps `hook` alive:
@@ -103,3 +88,62 @@ Place `mcp.json` under `.vscode/` (or your global MCP directory) so Copilot Chat
 ```
 - 确认 `python` 指向虚拟环境；MCP stdin 与 HTTP 服务器会在指定的主机和端口同时启动。
 - 进程需保持常驻；`hook` 工具不会结束，所有 Chat Completion 请求都会通过后台队列转发。
+
+---
+
+## Important Note: Streaming Disabled / 重要说明：流式已禁用
+- All `stream=true` requests are handled as non-stream JSON responses.
+- 所有 `stream=true` 请求均按非流式 JSON 返回。
+
+## Endpoints & Examples / 接口与示例
+
+### OpenAI non-stream / OpenAI 非流式
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false
+  }'
+```
+
+### Anthropic non-stream / Anthropic 非流式
+```bash
+curl -X POST http://127.0.0.1:8000/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false
+  }'
+```
+
+## Timeouts / 超时
+- Server-side per-request timeout is configurable via `MCPTB_HTTP_TIMEOUT` (seconds). Use `none`/`0`/`infinite` for no timeout.
+- 服务器端每次请求的等待时间可通过 `MCPTB_HTTP_TIMEOUT` 设置（秒）。使用 `none`/`0`/`infinite` 关闭超时。
+
+## WSL2 → Windows access / WSL2 访问 Windows 服务
+- From WSL2, discover Windows host IP: `ip route | awk '/default/ {print $3}'` or `grep nameserver /etc/resolv.conf | awk '{print $2}'`.
+- Use `http://<windows-ip>:8000` to call the bridge from WSL2.
+
+## Claude Code (WSL2) example / 示例
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ANTHROPIC_AUTH_TOKEN="no-need-but-placeholder"
+export ANTHROPIC_MODEL="local-vscode-copilot"
+export ANTHROPIC_BASE_URL="http://<windows-ip>:8000"  # exposes /v1/messages
+
+echo "[Claude Code/WSL] Using gateway: $ANTHROPIC_BASE_URL"
+
+mkdir -p "$HOME/.npm-global/lib"
+npm config set prefix "$HOME/.npm-global" >/dev/null 2>&1 || true
+
+if command -v claude >/dev/null 2>&1; then
+  claude "$@" --dangerously-skip-permissions
+else
+  npx -y @anthropic-ai/claude-code "$@"
+fi
+```
