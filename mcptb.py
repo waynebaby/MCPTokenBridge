@@ -455,12 +455,11 @@ bridge = MCPTokenBridge()
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
 logger = logging.getLogger("mcptb")
 
-# Global flag: allow forcing non-streaming via env / 全局开关：通过环境变量强制禁用流式
+# Global streaming policy: permanently disabled / 全局策略：永久禁用流式
 def streaming_disabled() -> bool:
-    # Default disabled to be safe; set env to 0/false to enable streaming
-    # 默认关闭流式；设置环境变量为 0/false 可开启
-    val = os.getenv("MCPTB_DISABLE_STREAMING", "1").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    # Streaming is no longer supported; always return True.
+    # 流式响应不再受支持；始终返回 True。
+    return True
 
 
 @app.post("/v1/chat/completions")
