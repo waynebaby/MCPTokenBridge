@@ -52,6 +52,19 @@ flowchart LR
   F --> G[JSONResponse 200]
 ```
 
+## Human Workflow / 人类操作流程
+
+1. 启动具备订阅的智能体（例如 VS Code GitHub Copilot）。
+  - Ensure Copilot is active in VS Code; login and subscription required.
+2. 启动 MCP 并允许 `hook` 被调用。
+  - Provide an `mcp.json` entry that runs `python mcptb.py --host 0.0.0.0 --port 8000`; the `hook` warms up and marks the session ready.
+3. 在对话中调用 MCP `hook`，例如输入 “hi”，完成转向与就绪检测。
+  - Copilot Chat → call MCP `hook` with simple input to confirm the bridge is responsive.
+4. 启动 Claude Code，访问公开端口并进行非流式请求。
+  - Point `ANTHROPIC_BASE_URL` to `http://<windows-ip>:8000` and run the CLI; the bridge returns non-stream JSON.
+
+
+
 ## Flow (English)
 1. HTTP `POST /v1/chat/completions` enqueues the request and waits for the `hook` worker reply.
 2. The `hook` tool never terminates; it runs on a fixed background thread and returns MCP headers along with the chat response.
