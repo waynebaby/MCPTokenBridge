@@ -24,7 +24,7 @@ import time
 import httpx
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 try:
     from fastmcp import FastMCP, Context  # type: ignore
@@ -86,6 +86,21 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage] = Field(..., description="Conversation history")
     stream: bool = Field(False, description="Whether streaming is requested")
 
+# Minimal Anthropic-style input models (for /v1/messages shim)
+class AnthropicContentBlock(BaseModel):
+    type: str = Field(default="text")
+    text: str = Field(default="")
+
+class AnthropicMessage(BaseModel):
+    role: str
+    # Accept either list of blocks or simple string
+    content: Any
+
+class AnthropicMessagesRequest(BaseModel):
+    model: str
+    messages: List[AnthropicMessage]
+    stream: bool = Field(False)
+
 
 class ChatCompletionChoice(BaseModel):
     index: int
@@ -98,6 +113,21 @@ class ChatCompletionResponse(BaseModel):
     model: str
     object: str = Field("chat.completion", description="Response type")
     choices: List[ChatCompletionChoice]
+
+
+class ChatCompletionStreamChoice(BaseModel):
+    """Streaming response choice / 流式响应选项."""
+    index: int
+    delta: ChatMessage  # Contains role/content increments
+    finish_reason: Optional[str] = None
+
+
+class ChatCompletionStreamResponse(BaseModel):
+    """OpenAI-compatible streaming response / OpenAI 风格流式响应."""
+    id: str
+    model: str
+    object: str = Field("chat.completion.chunk", description="Streaming response type")
+    choices: List[ChatCompletionStreamChoice]
 
 
 @dataclass
@@ -145,6 +175,8 @@ class MCPTokenBridge:
         # Store the hook's event loop and internal queue / 保存 hook 的事件循环与内部队列
         self.hook_loop: Optional[asyncio.AbstractEventLoop] = None
         self.queue: Optional[asyncio.Queue[PendingTask]] = None
+        # Track whether MCP session is ready / 跟踪 MCP 会话是否已准备好
+        self.session_ready: bool = False
 
     # Local generation removed; bridge requires MCP hook
     # 已移除本地生成；桥接器要求 MCP hook。
@@ -156,14 +188,18 @@ class MCPTokenBridge:
         """Process one pending task on the hook loop.
 
         在 hook 事件循环中处理一条待采样任务。
+        ALL MCP operations happen here in hook thread.
+        所有 MCP 操作都在 hook 线程中进行。
         """
         assert self.ctx is not None
         req = pending.request
         parts: List[str] = [f"{m.role}: {m.content}" for m in req.messages]
         prompt = "\n".join(parts) if parts else "Hello from MCPTokenBridge!"
         try:
+            logger.debug(f"Hook processing non-stream request: {prompt[:50]}...")
             result = await self.ctx.sample(messages=prompt, max_tokens=256)
             text = getattr(result, "text", "") or ""
+            logger.debug(f"Hook got response: {len(text)} chars")
             assistant_message = ChatMessage(role="assistant", content=text)
             choice = ChatCompletionChoice(index=0, message=assistant_message)
             completion = ChatCompletionResponse(
@@ -171,9 +207,50 @@ class MCPTokenBridge:
                 model=req.model,
                 choices=[choice],
             )
-            pending.future.set_result(completion)
+            # Only set the future if it is still pending / 仅在未完成时设置结果
+            if not pending.future.cancelled() and not pending.future.done():
+                pending.future.set_result(completion)
+            else:
+                logger.warning("Hook future already completed/cancelled; skipping set_result")
         except Exception as exc:
-            pending.future.set_exception(exc)
+            logger.error(f"Hook processing error: {exc}", exc_info=True)
+            # Only set exception if future is still pending / 仅在未完成时设置异常
+            if not pending.future.cancelled() and not pending.future.done():
+                pending.future.set_exception(exc)
+            else:
+                logger.warning("Hook future already completed/cancelled; skipping set_exception")
+
+    async def _process_pending_streaming(self, pending: PendingTask) -> None:
+        """Process one pending task with streaming output.
+
+        在 hook 事件循环中处理流式采样任务。
+        Note: VS Code Copilot's ctx.sample() may not support streaming,
+        so we perform regular sampling and let HTTP layer handle streaming chunks.
+        
+        注意：所有 MCP 操作都在 hook 线程中执行，不在 HTTP 线程中。
+        """
+        assert self.ctx is not None
+        req = pending.request
+        parts: List[str] = [f"{m.role}: {m.content}" for m in req.messages]
+        prompt = "\n".join(parts) if parts else "Hello from MCPTokenBridge!"
+        try:
+            logger.debug(f"Hook processing stream request: {prompt[:50]}...")
+            # Use regular sampling (not streaming) to get the full response
+            # VS Code Copilot may not support streaming sampling at MCP level
+            result = await self.ctx.sample(messages=prompt, max_tokens=256)
+            text = getattr(result, "text", "") or ""
+            logger.debug(f"Hook got streaming response: {len(text)} chars")
+            # Return full text; HTTP layer will split into streaming chunks
+            if not pending.future.cancelled() and not pending.future.done():
+                pending.future.set_result(text)
+            else:
+                logger.warning("Hook future already completed/cancelled; skipping set_result (stream)")
+        except Exception as exc:
+            logger.error(f"Hook streaming error: {exc}", exc_info=True)
+            if not pending.future.cancelled() and not pending.future.done():
+                pending.future.set_exception(exc)
+            else:
+                logger.warning("Hook future already completed/cancelled; skipping set_exception (stream)")
 
     async def _await_future(self, fut: asyncio.Future) -> ChatCompletionResponse:
         return await fut  # helper to await hook-side futures from HTTP loop
@@ -194,7 +271,30 @@ class MCPTokenBridge:
         asyncio.run_coroutine_threadsafe(self.queue.put(pending), self.hook_loop)
         # Await completion by awaiting the hook future via the hook loop
         wrapped = asyncio.run_coroutine_threadsafe(self._await_future(fut), self.hook_loop)
-        return await asyncio.wrap_future(wrapped)
+        return await asyncio.wait_for(asyncio.wrap_future(wrapped), timeout=30.0)
+
+    async def submit_via_hook_streaming(self, request: ChatCompletionRequest) -> str:
+        """Submit a request to the MCP hook queue and await streaming result.
+
+        将请求提交到 MCP hook 队列，并等待流式完成。返回文本响应。
+        The hook thread decides whether to use streaming based on request.stream flag.
+        Hook 线程根据 request.stream 标志决定是否使用流式处理。
+        """
+        if self.ctx is None or self.hook_loop is None or self.queue is None:
+            raise RuntimeError("Hook not active 钩子未运行")
+        # Create a future on the hook loop
+        fut = asyncio.run_coroutine_threadsafe(
+            self._create_future_on_hook(), self.hook_loop
+        ).result()
+        pending = PendingTask(request=request, future=fut)
+        # Enqueue on hook loop - hook will process it based on stream flag
+        asyncio.run_coroutine_threadsafe(self.queue.put(pending), self.hook_loop)
+        # Await completion with timeout
+        wrapped = asyncio.run_coroutine_threadsafe(self._await_future_streaming(fut), self.hook_loop)
+        return await asyncio.wait_for(asyncio.wrap_future(wrapped), timeout=30.0)
+
+    async def _await_future_streaming(self, fut: asyncio.Future) -> str:
+        return await fut  # helper to await hook-side futures from HTTP loop (streaming)
 
     async def _create_future_on_hook(self) -> asyncio.Future:
         loop = asyncio.get_running_loop()
@@ -355,22 +455,263 @@ bridge = MCPTokenBridge()
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
 logger = logging.getLogger("mcptb")
 
+# Global flag: allow forcing non-streaming via env / 全局开关：通过环境变量强制禁用流式
+def streaming_disabled() -> bool:
+    # Default disabled to be safe; set env to 0/false to enable streaming
+    # 默认关闭流式；设置环境变量为 0/false 可开启
+    val = os.getenv("MCPTB_DISABLE_STREAMING", "1").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
 
 @app.post("/v1/chat/completions")
-async def chat_completions_endpoint(request: ChatCompletionRequest) -> JSONResponse:
+async def chat_completions_endpoint(request: ChatCompletionRequest):
     logger.info(f"HTTP RX: {request.model_dump()}")
-    if request.stream:
-        raise HTTPException(status_code=400, detail="Streaming not supported in demo")
-    if bridge.ctx is None or bridge.hook_loop is None or bridge.queue is None:
-        raise HTTPException(status_code=503, detail="Hook not active 钩子未运行")
+    
+    # Accept clients that send "auto" or empty model by mapping to bridge default
+    if not request.model or request.model == "auto":
+        request.model = bridge.model_name
+    
+    # Check if hook is active and session is ready
+    if bridge.ctx is None:
+        logger.error("Hook not initialized - ctx is None")
+        raise HTTPException(status_code=503, detail="Hook not initialized - MCP context missing")
+    
+    if bridge.hook_loop is None:
+        logger.error("Hook not initialized - hook_loop is None")
+        raise HTTPException(status_code=503, detail="Hook not initialized - event loop missing")
+    
+    if bridge.queue is None:
+        logger.error("Hook not initialized - queue is None")
+        raise HTTPException(status_code=503, detail="Hook not initialized - request queue missing")
+    
+    if not bridge.session_ready:
+        logger.error("MCP session not ready - warmup may have failed")
+        raise HTTPException(status_code=503, detail="MCP session not ready - VS Code Copilot not available")
+    
+    # Handle streaming requests / 处理流式请求
+    if request.stream and not streaming_disabled():
+        async def stream_generator():
+            """Generate OpenAI-compatible streaming chunks.
+            
+            生成 OpenAI 兼容的流式块。
+            """
+            try:
+                logger.info(f"[STREAM] Starting stream for model {request.model}")
+                # Get the full response text from bridge
+                # All MCP operations happen in hook thread via asyncio.run_coroutine_threadsafe
+                text = await bridge.submit_via_hook_streaming(request)
+                logger.info(f"[STREAM] Got response: {len(text) if text else 0} chars")
+                
+                # Handle None or empty response
+                if not text:
+                    text = "[Empty response]"
+                
+                # Split text into chunks for streaming effect
+                # 将文本分割成块进行流式处理
+                for i, char in enumerate(text):
+                    delta = ChatMessage(role="assistant", content=char)
+                    choice = ChatCompletionStreamChoice(
+                        index=0,
+                        delta=delta,
+                        finish_reason=None
+                    )
+                    response = ChatCompletionStreamResponse(
+                        id=f"mcp-stream-{i}",
+                        model=request.model,
+                        choices=[choice]
+                    )
+                    # OpenAI format: "data: {json}\n\n"
+                    yield f"data: {response.model_dump_json(exclude_none=True)}\n\n"
+                
+                # Final chunk with finish_reason
+                # 最后一个块包含 finish_reason
+                final_delta = ChatMessage(role="assistant", content="")
+                final_choice = ChatCompletionStreamChoice(
+                    index=0,
+                    delta=final_delta,
+                    finish_reason="stop"
+                )
+                final_response = ChatCompletionStreamResponse(
+                    id="mcp-stream-final",
+                    model=request.model,
+                    choices=[final_choice]
+                )
+                yield f"data: {final_response.model_dump_json(exclude_none=True)}\n\n"
+                yield "data: [DONE]\n\n"
+                logger.info(f"[STREAM] Stream completed")
+            except Exception as exc:
+                logger.error(f"[STREAM] Streaming error: {exc}", exc_info=True)
+                # Yield error in OpenAI-compatible format
+                error_response = {
+                    "error": {
+                        "message": str(exc),
+                        "type": type(exc).__name__
+                    }
+                }
+                yield f"data: {json.dumps(error_response)}\n\n"
+        
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    
+    # Handle non-streaming requests / 处理非流式请求
     try:
+        if request.stream and streaming_disabled():
+            logger.info("Streaming disabled via env; falling back to non-streaming")
+        logger.info(f"[NON-STREAM] Starting request for model {request.model}")
         response = await bridge.submit_via_hook(request)
+        logger.info(f"[NON-STREAM] Got response: {len(response.choices[0].message.content) if response.choices else 0} chars")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Sampling failed 采样失败: {exc}")
+        logger.error(f"[NON-STREAM] Sampling failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Sampling failed: {exc}")
+    
     payload = response.model_dump()
-    logger.info(f"HTTP TX: {payload}")
+    # Convenience: top-level text for simpler clients
+    try:
+        payload["text"] = response.choices[0].message.content
+    except Exception:
+        payload["text"] = ""
+    logger.info(f"HTTP TX: {len(payload.get('text', ''))} chars")
     headers = {"X-MCP-Bridge": "hook", "X-MCP-Model": response.model}
     return JSONResponse(status_code=200, content=payload, headers=headers)
+# --------------------------
+# Anthropic /v1/messages shim
+# --------------------------
+
+def _anthropic_to_chat_messages(messages: List[AnthropicMessage]) -> List[ChatMessage]:
+    converted: List[ChatMessage] = []
+    for m in messages:
+        role = m.role
+        content = m.content
+        if isinstance(content, list):
+            # list of blocks
+            parts: List[str] = []
+            for b in content:
+                try:
+                    block = AnthropicContentBlock.model_validate(b)
+                    if block.type == "text":
+                        parts.append(block.text)
+                except Exception:
+                    continue
+            text = "".join(parts)
+        elif isinstance(content, str):
+            text = content
+        else:
+            text = str(content)
+        converted.append(ChatMessage(role=role, content=text))
+    return converted
+
+
+@app.post("/v1/messages")
+async def anthropic_messages_endpoint(request: AnthropicMessagesRequest):
+    # This endpoint mimics Anthropic Messages API using our MCP hook sampling
+    logger.info(f"Anthropic HTTP RX: {request.model_dump()}")
+
+    # Check hook/session readiness
+    if bridge.ctx is None:
+        raise HTTPException(status_code=503, detail="Hook not initialized - MCP context missing")
+    if bridge.hook_loop is None:
+        raise HTTPException(status_code=503, detail="Hook not initialized - event loop missing")
+    if bridge.queue is None:
+        raise HTTPException(status_code=503, detail="Hook not initialized - request queue missing")
+    if not bridge.session_ready:
+        raise HTTPException(status_code=503, detail="MCP session not ready - VS Code Copilot not available")
+
+    # Translate Anthropic-style messages to our ChatMessage list
+    chat_messages = _anthropic_to_chat_messages(request.messages)
+    chat_req = ChatCompletionRequest(model=request.model, messages=chat_messages, stream=False)
+
+    # If streaming disabled via env, force non-stream / 若关闭流式则强制非流
+    if request.stream and not streaming_disabled():
+        async def anthropic_stream():
+            try:
+                # Get full text via hook, then emit Anthropic SSE events
+                text = await bridge.submit_via_hook_streaming(chat_req)
+                if text is None:
+                    text = ""
+
+                # message_start
+                start_event = {
+                    "type": "message_start",
+                    "message": {
+                        "id": f"msg_{int(time.time()*1000)}",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": request.model,
+                        "content": [
+                            {"type": "text", "text": ""}
+                        ],
+                    },
+                }
+                yield f"event: message_start\ndata: {json.dumps(start_event)}\n\n"
+
+                # content_block_start
+                cbs_event = {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                yield f"event: content_block_start\ndata: {json.dumps(cbs_event)}\n\n"
+
+                # content_block_delta (stream text)
+                for ch in text:
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": ch},
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+                # content_block_stop
+                cbst_event = {"type": "content_block_stop", "index": 0}
+                yield f"event: content_block_stop\ndata: {json.dumps(cbst_event)}\n\n"
+
+                # message_delta
+                md_event = {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}}
+                yield f"event: message_delta\ndata: {json.dumps(md_event)}\n\n"
+
+                # message_stop
+                stop_event = {"type": "message_stop"}
+                yield f"event: message_stop\ndata: {json.dumps(stop_event)}\n\n"
+
+                # done
+                yield "data: [DONE]\n\n"
+            except Exception as exc:
+                logger.error(f"Anthropic streaming error: {exc}", exc_info=True)
+                err = {"error": {"message": str(exc), "type": type(exc).__name__}}
+                yield f"data: {json.dumps(err)}\n\n"
+
+        return StreamingResponse(anthropic_stream(), media_type="text/event-stream")
+
+    # Non-streaming: return Anthropic-style message object
+    try:
+        # Force non-stream path always when disabled, or when not requested
+        if request.stream and streaming_disabled():
+            logger.info("Anthropic stream requested but disabled via env; using non-stream response")
+        completion = await bridge.submit_via_hook(chat_req)
+        text = completion.choices[0].message.content if completion.choices else ""
+        resp = {
+            "id": f"msg_{int(time.time()*1000)}",
+            "type": "message",
+            "role": "assistant",
+            "model": request.model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+        }
+        return JSONResponse(status_code=200, content=resp)
+    except Exception as exc:
+        # Return a safe assistant message instead of 500 to avoid proxy None handling
+        # 返回安全的助手消息而非 500，以避免代理层处理 None 失败
+        logger.error(f"Anthropic non-streaming error: {exc}", exc_info=True)
+        resp = {
+            "id": f"msg_{int(time.time()*1000)}",
+            "type": "message",
+            "role": "assistant",
+            "model": request.model,
+            "content": [{"type": "text", "text": f"[Error] {exc}"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+        }
+        return JSONResponse(status_code=200, content=resp)
 
 
 # Health endpoint removed with hook_active logic
@@ -417,17 +758,45 @@ def run_stdio_loop() -> None:
         logger.info("FastMCP hook started; keeping session open")
 
         # Warm-up: try a minimal sample to establish session / 预热：尝试一次最小采样以建立会话
-        for attempt in range(1, 21):
+        session_established = False
+        for attempt in range(1, 31):  # Try up to 30 times
             try:
+                logger.info(f"Session warm-up attempt {attempt}/30...")
                 _ = await ctx.sample(messages="warmup", max_tokens=1)
-                logger.info("FastMCP session warm-up complete")
+                logger.info("✓ FastMCP session warm-up complete - ready for requests")
+                session_established = True
+                bridge.session_ready = True  # Mark session as ready
                 break
             except Exception as exc:
-                logger.warning(f"Warm-up attempt {attempt} failed: {exc}")
-                await asyncio.sleep(0.5)
+                logger.warning(f"  Warm-up attempt {attempt} failed: {exc}")
+                if attempt < 30:
+                    await asyncio.sleep(1.0)  # Wait longer between attempts
+                else:
+                    logger.error(f"  Warm-up attempt {attempt}: {exc}")
+        
+        if not session_established:
+            logger.error("✗ CRITICAL: Failed to establish MCP session after 30 attempts")
+            logger.error("  The VS Code Copilot session may not be available")
+            logger.error("  This usually means:")
+            logger.error("  1. VS Code Copilot is not running")
+            logger.error("  2. MCP context is not properly initialized")
+            logger.error("  3. Network connection issue")
+            # Don't crash - continue anyway and let requests fail with clear errors
+            bridge.session_ready = False
+        
+        logger.info("Hook worker loop started - waiting for HTTP requests")
         while True:
-            pending = await bridge.queue.get()
-            await bridge._process_pending(pending)
+            try:
+                pending = await bridge.queue.get()
+                logger.debug(f"Hook got request: stream={pending.request.stream}, model={pending.request.model}")
+                # Check if streaming is requested; route to appropriate handler
+                # 检查是否请求流式响应；路由到相应处理器
+                if pending.request.stream:
+                    await bridge._process_pending_streaming(pending)
+                else:
+                    await bridge._process_pending(pending)
+            except Exception as exc:
+                logger.error(f"Hook worker error: {exc}", exc_info=True)
 
     # Try common run methods; error if none / 尝试常见运行方法；若不可用则报错
     if hasattr(server, "run_stdio_server"):

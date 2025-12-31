@@ -27,16 +27,48 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | python mcptb.py --host 0
 ## Flow (English)
 1. HTTP `POST /v1/chat/completions` enqueues the request and waits for the `hook` worker reply.
 2. The `hook` tool never terminates; it runs on a fixed background thread and returns MCP headers along with the chat response.
+3. **Streaming support** (new): Set `"stream": true` in the request to receive Server-Sent Events (SSE) formatted responses with `Content-Type: text/event-stream`. Chunks are sent character-by-character in the format `data: {json}\n\n` followed by a final `data: [DONE]\n\n`.
 
 ## 工作流（中文）
 1. HTTP `POST /v1/chat/completions` 会将请求入队，等待 `hook` 工作者返回结果。
 2. `hook` 工具常驻后台线程，不会结束，同时返回 MCP 相关的响应头与聊天内容。
+3. **流式支持**（新功能）：在请求中设置 `"stream": true` 可以接收 Server-Sent Events (SSE) 格式的响应，Content-Type 为 `text/event-stream`。每个块按字符逐个发送，格式为 `data: {json}\n\n`，最后以 `data: [DONE]\n\n` 结束。
 
 ## Project Layout / 目录结构
 - `mcptb.py` — single runtime module for both HTTP and MCP modes / 兼作 HTTP 与 MCP 入口的单文件模块
 - `requirements.txt` — dependencies / 依赖声明
 - `tests/` — pytest suite / 单元测试
 - `logs/`, `bin/` — outputs and helper scripts / 输出与辅助脚本
+
+## Streaming API Usage Example / 流式 API 使用示例
+
+### Non-streaming request (traditional) / 非流式请求（传统）
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mcp-bridge-demo",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false
+  }'
+# Response: {"id":"mcp-fastmcp-response","model":"mcp-bridge-demo","object":"chat.completion",...}
+```
+
+### Streaming request with SSE / 流式请求（SSE）
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mcp-bridge-demo",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+# Response stream:
+# data: {"id":"mcp-stream-0","model":"mcp-bridge-demo","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"H"}}]}
+# data: {"id":"mcp-stream-1","model":"mcp-bridge-demo","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"e"}}]}
+# ... (more chunks) ...
+# data: [DONE]
+```
 
 ## VS Code MCP configuration (English)
 Place `mcp.json` under `.vscode/` (or your global MCP directory) so Copilot Chat launches the combined entrypoint and keeps `hook` alive:
