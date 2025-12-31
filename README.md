@@ -24,6 +24,34 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | python mcptb.py --host 0
 - **English**: Use `--host 0.0.0.0` when you want every network adapter (e.g., `192.168.55.10:8888` and `192.168.1.11:8888`) to be reachable on the same port. Use a specific host (e.g., `--host 192.168.55.10 --port 8888`) to bind only that adapter; other adapters will not accept connections.
 - **中文**：当需要让所有网卡（例如 `192.168.55.10:8888` 与 `192.168.1.11:8888`）都可访问时，使用 `--host 0.0.0.0`。若只想绑定某个适配器，请指定具体地址（如 `--host 192.168.55.10 --port 8888`）；此时其他适配器将无法访问。
 
+## Architecture Diagram / 架构图
+
+```mermaid
+sequenceDiagram
+  participant Client as Client (Claude Code/HTTP)
+  participant FastAPI as FastAPI (mcptb.py)
+  participant Hook as MCP Hook (FastMCP)
+  participant Copilot as VS Code Copilot
+
+  Client->>FastAPI: POST /v1/chat/completions or /v1/messages (stream=false)
+  FastAPI->>FastAPI: Validate payload + map model ("auto")
+  FastAPI->>Hook: Enqueue PendingTask (Future)
+  Hook->>Copilot: ctx.sample(messages=prompt)
+  Copilot-->>Hook: text
+  Hook->>FastAPI: Resolve Future with completion JSON
+  FastAPI-->>Client: 200 JSON (non-stream)
+```
+
+```mermaid
+flowchart LR
+  A[HTTP Request] --> B{Hook session ready?}
+  B -- No --> C[503 Service Unavailable]
+  B -- Yes --> D[Submit via hook queue]
+  D --> E[ctx.sample]
+  E --> F[Build response models]
+  F --> G[JSONResponse 200]
+```
+
 ## Flow (English)
 1. HTTP `POST /v1/chat/completions` enqueues the request and waits for the `hook` worker reply.
 2. The `hook` tool never terminates; it runs on a fixed background thread and returns MCP headers along with the chat response.
