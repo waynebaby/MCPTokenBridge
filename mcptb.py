@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 MCPTokenBridge
 ===============
@@ -15,12 +16,23 @@ import json
 import sys
 import threading
 from dataclasses import dataclass, field
-from queue import Queue
 from typing import Any, Dict, List, Optional, Tuple
+import logging
+import os
+import asyncio
+import time
+import httpx
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
+try:
+    from fastmcp import FastMCP, Context  # type: ignore
+    FASTMCP_AVAILABLE = True
+except Exception:
+    FastMCP = None  # type: ignore
+    Context = None  # type: ignore
+    FASTMCP_AVAILABLE = False
 
 # 本地精简版 fastmcp 框架 / lightweight fastmcp-inspired harness
 # 只负责 STDIN/STDOUT JSON-RPC 循环，保持与用户要求一致。
@@ -37,6 +49,7 @@ class StdioMCPServer:
             payload = line.strip()
             if not payload:
                 continue
+            logging.getLogger("mcptb").info(f"STDIO RX: {payload}")
             try:
                 message = json.loads(payload)
                 reply = self.handler.handle_mcp_call(message)
@@ -46,6 +59,10 @@ class StdioMCPServer:
                     result={},
                     error={"code": -32700, "message": "Invalid JSON"},
                 )
+            try:
+                logging.getLogger("mcptb").info(f"STDIO TX: {reply.to_json()}")
+            except Exception:
+                logging.getLogger("mcptb").exception("Failed to serialize STDIO reply")
             sys.stdout.write(reply.to_json() + "\n")
             sys.stdout.flush()
 
@@ -99,14 +116,14 @@ class MCPResponse:
 
 
 @dataclass
-class PendingHttpCall:
-    """Pending HTTP call waiting for hook / 待处理 HTTP 请求."""
+class PendingTask:
+    """A pending HTTP message to be sampled by the MCP hook.
+
+    由 MCP hook 线程执行采样的待处理 HTTP 消息。
+    """
 
     request: ChatCompletionRequest
-    event: threading.Event = field(default_factory=threading.Event)
-    response: Optional[ChatCompletionResponse] = None
-    headers: Dict[str, str] = field(default_factory=dict)
-    error: Optional[str] = None
+    future: asyncio.Future  # resolved with ChatCompletionResponse / 异步结果
 
 
 # --------------------------------
@@ -123,67 +140,71 @@ class MCPTokenBridge:
 
     def __init__(self, model_name: str = "mcp-bridge-demo") -> None:
         self.model_name = model_name
-        self._requests: "Queue[PendingHttpCall]" = Queue()
-        self._hook_thread = threading.Thread(
-            target=self._hook_worker,
-            name="hook-worker",
-            daemon=True,
-        )
-        self._hook_thread.start()
+        # Direct sampling: store ctx when hook starts / 直接采样：在 hook 启动时保存 ctx
+        self.ctx: Optional["Context"] = None
+        # Store the hook's event loop and internal queue / 保存 hook 的事件循环与内部队列
+        self.hook_loop: Optional[asyncio.AbstractEventLoop] = None
+        self.queue: Optional[asyncio.Queue[PendingTask]] = None
 
-    def _generate_reply(self, messages: List[ChatMessage]) -> str:
-        """Generate a simple echo-style reply.
+    # Local generation removed; bridge requires MCP hook
+    # 已移除本地生成；桥接器要求 MCP hook。
 
-        生成简单的回声式回复，便于演示。真实场景可替换为模型调用。
+    # Local hook worker removed; external MCP tool must drain queue
+    # 已移除本地 Hook 线程；必须由外部 MCP 工具消费队列。
+
+    async def _process_pending(self, pending: PendingTask) -> None:
+        """Process one pending task on the hook loop.
+
+        在 hook 事件循环中处理一条待采样任务。
         """
+        assert self.ctx is not None
+        req = pending.request
+        parts: List[str] = [f"{m.role}: {m.content}" for m in req.messages]
+        prompt = "\n".join(parts) if parts else "Hello from MCPTokenBridge!"
+        try:
+            result = await self.ctx.sample(messages=prompt, max_tokens=256)
+            text = getattr(result, "text", "") or ""
+            assistant_message = ChatMessage(role="assistant", content=text)
+            choice = ChatCompletionChoice(index=0, message=assistant_message)
+            completion = ChatCompletionResponse(
+                id="mcp-fastmcp-response",
+                model=req.model,
+                choices=[choice],
+            )
+            pending.future.set_result(completion)
+        except Exception as exc:
+            pending.future.set_exception(exc)
 
-        if not messages:
-            return "Hello from MCPTokenBridge!"
-        return f"Echo: {messages[-1].content}"
+    async def _await_future(self, fut: asyncio.Future) -> ChatCompletionResponse:
+        return await fut  # helper to await hook-side futures from HTTP loop
 
-    def _hook_worker(self) -> None:
-        """Dedicated hook thread to process HTTP requests / 固定 Hook 线程轮询队列."""
+    async def submit_via_hook(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        """Submit a request to the MCP hook queue and await its result.
 
-        while True:
-            pending = self._requests.get()
-            try:
-                completion = self.chat_completion(pending.request)
-                pending.response = completion
-                pending.headers.update(
-                    {
-                        "X-MCP-Bridge": "hook",
-                        "X-MCP-Model": completion.model,
-                    }
-                )
-            except Exception as exc:  # keep thread alive
-                pending.error = f"Hook failure 钩子错误: {exc}"
-            finally:
-                pending.event.set()
-
-    def submit_chat_request(self, request: ChatCompletionRequest, timeout: float = 30.0) -> Tuple[ChatCompletionResponse, Dict[str, str]]:
-        """Queue a chat completion for the hook worker and wait for result.
-
-        将请求送入 Hook 队列并阻塞等待返回，避免阻塞其他 HTTP 请求。
+        将请求提交到 MCP hook 队列，并等待其完成。
         """
+        if self.ctx is None or self.hook_loop is None or self.queue is None:
+            raise RuntimeError("Hook not active 钩子未运行")
+        # Create a future on the hook loop
+        fut = asyncio.run_coroutine_threadsafe(
+            self._create_future_on_hook(), self.hook_loop
+        ).result()
+        pending = PendingTask(request=request, future=fut)
+        # Enqueue on hook loop
+        asyncio.run_coroutine_threadsafe(self.queue.put(pending), self.hook_loop)
+        # Await completion by awaiting the hook future via the hook loop
+        wrapped = asyncio.run_coroutine_threadsafe(self._await_future(fut), self.hook_loop)
+        return await asyncio.wrap_future(wrapped)
 
-        pending = PendingHttpCall(request=request)
-        self._requests.put(pending)
-        if not pending.event.wait(timeout=timeout):
-            raise TimeoutError("Hook response timed out 钩子响应超时")
-        if pending.error:
-            raise RuntimeError(pending.error)
-        assert pending.response is not None
-        return pending.response, pending.headers
+    async def _create_future_on_hook(self) -> asyncio.Future:
+        loop = asyncio.get_running_loop()
+        return loop.create_future()
 
-    def chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        reply_text = self._generate_reply(request.messages)
-        assistant_message = ChatMessage(role="assistant", content=reply_text)
-        choice = ChatCompletionChoice(index=0, message=assistant_message)
-        return ChatCompletionResponse(
-            id="mcp-bridge-response",
-            model=request.model,
-            choices=[choice],
-        )
+    # submit_chat_request removed; HTTP calls sample_via_ctx directly
+    # 移除 submit_chat_request；HTTP 直接调用 sample_via_ctx。
+
+    # Removed direct local completion; all requests must go through MCP hook
+    # 移除本地完成；所有请求必须通过 MCP hook。
 
     def handle_mcp_call(self, payload: Dict[str, Any]) -> MCPResponse:
         """Process a single MCP JSON-RPC payload.
@@ -207,14 +228,64 @@ class MCPTokenBridge:
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
+                                        "input": {
+                                            "type": "string",
+                                            "description": "Simplest Copilot call: single user input"
+                                        },
                                         "model": {"type": "string"},
-                                        "messages": {"type": "array"},
-                                    },
-                                    "required": ["messages", "model"],
+                                        "messages": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "additionalProperties": False,
+                                                "properties": {
+                                                    "role": {"type": "string"},
+                                                    "content": {"type": "string"}
+                                                },
+                                                "required": ["role", "content"]
+                                            }
+                                        }
+                                    }
                                 },
                             }
                         }
                     },
+                },
+            )
+
+        # List declared tools per MCP spec / MCP 规范的工具枚举
+        if method == "tools/list":
+            return MCPResponse(
+                id=message_id,
+                result={
+                    "tools": [
+                        {
+                            "name": "hook",
+                            "description": "Wrap chat completions for VS Code Copilot",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "input": {
+                                        "type": "string",
+                                        "description": "Simplest Copilot call: single user input"
+                                    },
+                                    "model": {"type": "string"},
+                                    "messages": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "additionalProperties": False,
+                                            "properties": {
+                                                "role": {"type": "string"},
+                                                "content": {"type": "string"}
+                                            },
+                                            "required": ["role", "content"]
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    ]
                 },
             )
 
@@ -227,8 +298,27 @@ class MCPTokenBridge:
                     error={"code": -32000, "message": "Unknown tool"},
                 )
 
+            arguments = params.get("arguments", {})
+            # Allow simplest Copilot convention: only "input" string -> convert to request
+            if isinstance(arguments, dict) and "input" in arguments and (
+                "messages" not in arguments
+            ):
+                input_text = arguments.get("input", "")
+                arguments = {
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": str(input_text)}],
+                    "stream": False,
+                }
+            # Some MCP clients send a raw string as arguments; accept it
+            elif isinstance(arguments, str):
+                arguments = {
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": arguments}],
+                    "stream": False,
+                }
+
             try:
-                request = ChatCompletionRequest.model_validate(params.get("arguments", {}))
+                request = ChatCompletionRequest.model_validate(arguments)
             except ValidationError as exc:  # bilingual message
                 return MCPResponse(
                     id=message_id,
@@ -239,11 +329,13 @@ class MCPTokenBridge:
                     },
                 )
 
-            # 通过 Hook 线程队列处理，确保工具永不结束 / route through hook queue
-            completion, headers = self.submit_chat_request(request)
-            result_payload = completion.model_dump()
-            result_payload["_headers"] = headers  # expose headers back to caller
-            return MCPResponse(id=message_id, result=result_payload)
+            # In MCP-only direct sampling mode, tools/call is not used here
+            # MCP 仅直采样模式下，此处不处理工具调用
+            return MCPResponse(
+                id=message_id,
+                result={},
+                error={"code": -32001, "message": "Direct sampling only 仅支持直接采样"},
+            )
 
         return MCPResponse(
             id=message_id,
@@ -259,18 +351,30 @@ class MCPTokenBridge:
 app = FastAPI(title="MCPTokenBridge", version="0.1.0")
 bridge = MCPTokenBridge()
 
+# Basic console logging for inputs/outputs / 控制台日志配置
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
+logger = logging.getLogger("mcptb")
+
 
 @app.post("/v1/chat/completions")
 async def chat_completions_endpoint(request: ChatCompletionRequest) -> JSONResponse:
+    logger.info(f"HTTP RX: {request.model_dump()}")
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming not supported in demo")
+    if bridge.ctx is None or bridge.hook_loop is None or bridge.queue is None:
+        raise HTTPException(status_code=503, detail="Hook not active 钩子未运行")
     try:
-        response, headers = bridge.submit_chat_request(request)
-    except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return JSONResponse(status_code=200, content=response.model_dump(), headers=headers)
+        response = await bridge.submit_via_hook(request)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Sampling failed 采样失败: {exc}")
+    payload = response.model_dump()
+    logger.info(f"HTTP TX: {payload}")
+    headers = {"X-MCP-Bridge": "hook", "X-MCP-Model": response.model}
+    return JSONResponse(status_code=200, content=payload, headers=headers)
+
+
+# Health endpoint removed with hook_active logic
+# 已移除健康检查端点（随 hook_active 逻辑删除）
 
 
 # ------------------------
@@ -285,7 +389,60 @@ def run_stdio_loop() -> None:
     同时通过后台线程运行 HTTP 服务器。
     """
 
-    StdioMCPServer(bridge).serve_forever()
+    # Require FastMCP; no fallback / 强制使用 FastMCP；不提供回退
+    if not FASTMCP_AVAILABLE or FastMCP is None:
+        raise RuntimeError("FastMCP is required but not available. Please install fastmcp.")
+
+    server = FastMCP(name="MCPTokenBridge")
+    # Bridge requires external MCP hook; no local fallback / 桥接器要求 MCP hook，无本地回退
+
+    @server.tool
+    async def hook(
+        input: str | None = None,
+        messages: list[dict[str, str]] | None = None,
+        model: str | None = None,
+        ctx: "Context" = None,
+    ) -> None:
+        """Long-lived hook tool that never returns.
+
+        长生命周期的 hook 工具，不返回结果：
+        - English: Loop forever, drain HTTP queue, sample via ctx, set pending events.
+        - 中文：无限循环，从 HTTP 队列取请求，调用 ctx 采样，设置待处理项的事件与响应。
+        """
+
+        # Capture ctx, create queue, and process tasks / 捕获 ctx，创建队列并处理任务
+        bridge.ctx = ctx
+        bridge.hook_loop = asyncio.get_running_loop()
+        bridge.queue = asyncio.Queue()
+        logger.info("FastMCP hook started; keeping session open")
+
+        # Warm-up: try a minimal sample to establish session / 预热：尝试一次最小采样以建立会话
+        for attempt in range(1, 21):
+            try:
+                _ = await ctx.sample(messages="warmup", max_tokens=1)
+                logger.info("FastMCP session warm-up complete")
+                break
+            except Exception as exc:
+                logger.warning(f"Warm-up attempt {attempt} failed: {exc}")
+                await asyncio.sleep(0.5)
+        while True:
+            pending = await bridge.queue.get()
+            await bridge._process_pending(pending)
+
+    # Try common run methods; error if none / 尝试常见运行方法；若不可用则报错
+    if hasattr(server, "run_stdio_server"):
+        logger.info("Starting FastMCP stdio server")
+        server.run_stdio_server()  # type: ignore
+        return
+    if hasattr(server, "run_stdio"):
+        logger.info("Starting FastMCP run_stdio")
+        server.run_stdio()  # type: ignore
+        return
+    if hasattr(server, "run"):
+        logger.info("Starting FastMCP run()")
+        server.run()  # type: ignore
+        return
+    raise RuntimeError("FastMCP server run method not found.")
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -305,7 +462,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     # 启动 HTTP 服务线程 / Start HTTP server thread
     import uvicorn
 
-    server_config = uvicorn.Config("mcptb:app", host=args.host, port=args.port, reload=False, lifespan="on")
+    server_config = uvicorn.Config(
+        app,
+        host=args.host,
+        port=args.port,
+        reload=False,
+        lifespan="on",
+        access_log=False,
+        log_level="warning",
+        use_colors=False,
+    )
     server = uvicorn.Server(server_config)
 
     http_thread = threading.Thread(target=server.run, name="uvicorn-thread", daemon=True)
