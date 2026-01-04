@@ -22,6 +22,7 @@ import os
 import asyncio
 import time
 import httpx
+import contextlib
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -466,15 +467,35 @@ bridge = MCPTokenBridge()
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
 logger = logging.getLogger("mcptb")
 
+# ANSI color helpers for RX/TX logs (disable with MCPTB_NO_COLOR=1) / RX/TX 彩色日志（通过 MCPTB_NO_COLOR=1 关闭）
+ANSI_RESET = "\033[0m"
+ANSI_RX = "\033[96m"   # Cyan for RX / 青色表示 RX
+ANSI_TX = "\033[95m"   # Magenta for TX / 品红表示 TX
+
+
+def _colorize(message: str, color: str) -> str:
+    disable = os.getenv("MCPTB_NO_COLOR", "").strip().lower() in {"1", "true", "yes", "on"}
+    if disable or not sys.stdout.isatty():
+        return message
+    return f"{color}{message}{ANSI_RESET}"
+
+
+def rx_log(message: str) -> str:
+    return _colorize(message, ANSI_RX)
+
+
+def tx_log(message: str) -> str:
+    return _colorize(message, ANSI_TX)
+
 # Streaming policy via env / 通过环境变量控制流式
 def streaming_disabled() -> bool:
-  
-    return False;
+    val = os.getenv("MCPTB_ENABLE_STREAMING", "").strip().lower()
+    return val not in {"1", "true", "yes", "on"}
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions_endpoint(request: ChatCompletionRequest):
-    logger.info(f"HTTP RX: {request.model_dump()}")
+    logger.info(rx_log(f"HTTP RX: {request.model_dump()}"))
     
     # Accept clients that send "auto" or empty model by mapping to bridge default
     if not request.model or request.model == "auto":
@@ -498,7 +519,10 @@ async def chat_completions_endpoint(request: ChatCompletionRequest):
         raise HTTPException(status_code=503, detail="MCP session not ready - VS Code Copilot not available")
     
     # Handle streaming requests via per-request queue / 通过每请求队列处理流式
-    if request.stream and not streaming_disabled():
+    if request.stream:
+        if streaming_disabled():
+            logger.error("Streaming requested but disabled via MCPTB_ENABLE_STREAMING")
+            raise HTTPException(status_code=503, detail="Streaming disabled via MCPTB_ENABLE_STREAMING")
         # Create per-request out_queue and enqueue into stream bridge
         out_queue: asyncio.Queue[StreamMsg] = asyncio.Queue(maxsize=1024)
         if bridge.stream_queue is None:
@@ -511,22 +535,22 @@ async def chat_completions_endpoint(request: ChatCompletionRequest):
             生成 OpenAI 兼容的流式块。
             """
             try:
-                logger.info(f"[STREAM] Starting stream for model {request.model}")
-                i = 0
+                logger.info(rx_log(f"HTTP STREAM RX: model={request.model}, stream=True"))
+                chunks = 0
                 while True:
                     msg = await out_queue.get()
                     if msg.msgFrag is None:
                         break
                     delta = ChatMessage(role="assistant", content=msg.msgFrag)
                     choice = ChatCompletionStreamChoice(index=0, delta=delta, finish_reason=None)
-                    response = ChatCompletionStreamResponse(id=f"mcp-stream-{i}", model=request.model, choices=[choice])
-                    i += 1
+                    response = ChatCompletionStreamResponse(id=f"mcp-stream-{chunks}", model=request.model, choices=[choice])
+                    chunks += 1
                     yield f"data: {response.model_dump_json(exclude_none=True)}\n\n"
                 final_choice = ChatCompletionStreamChoice(index=0, delta=ChatMessage(role="assistant", content=""), finish_reason="stop")
                 final_response = ChatCompletionStreamResponse(id="mcp-stream-final", model=request.model, choices=[final_choice])
                 yield f"data: {final_response.model_dump_json(exclude_none=True)}\n\n"
                 yield "data: [DONE]\n\n"
-                logger.info(f"[STREAM] Stream completed")
+                logger.info(tx_log(f"HTTP STREAM TX: model={request.model}, chunks={chunks}, stream=True"))
             except Exception as exc:
                 logger.error(f"[STREAM] Streaming error: {exc}", exc_info=True)
                 # Yield error in OpenAI-compatible format
@@ -548,9 +572,14 @@ async def chat_completions_endpoint(request: ChatCompletionRequest):
             raise HTTPException(status_code=503, detail="Hook not initialized - stream queue missing")
         await bridge.stream_queue.put((out_queue, request))
         try:
-            first = await out_queue.get()
-            _end = await out_queue.get()
-            text = first.msgFrag or ""
+            text_parts: List[str] = []
+            while True:
+                msg = await out_queue.get()
+                if msg.msgFrag is None:
+                    break
+                text_parts.append(msg.msgFrag)
+            text = "".join(text_parts)
+            logger.info(f"[NON-STREAM-Q] Completed via queue: model={request.model}, chars={len(text)}")
             assistant_message = ChatMessage(role="assistant", content=text)
             choice = ChatCompletionChoice(index=0, message=assistant_message)
             response = ChatCompletionResponse(id="mcp-fastmcp-response", model=request.model, choices=[choice])
@@ -560,9 +589,7 @@ async def chat_completions_endpoint(request: ChatCompletionRequest):
     else:
         # Original non-stream future path
         try:
-            if request.stream and streaming_disabled():
-                logger.info("Streaming disabled via env; falling back to non-streaming")
-            logger.info(f"[NON-STREAM] Starting request for model {request.model}")
+            logger.info(rx_log(f"HTTP RX (fallback): model={request.model}, stream={request.stream}"))
             response = await bridge.submit_via_hook(request)
             logger.info(f"[NON-STREAM] Got response: {len(response.choices[0].message.content) if response.choices else 0} chars")
         except Exception as exc:
@@ -575,7 +602,7 @@ async def chat_completions_endpoint(request: ChatCompletionRequest):
         payload["text"] = response.choices[0].message.content
     except Exception:
         payload["text"] = ""
-    logger.info(f"HTTP TX: {len(payload.get('text', ''))} chars")
+    logger.info(tx_log(f"HTTP TX: model={response.model}, chars={len(payload.get('text', ''))}, stream=False"))
     headers = {"X-MCP-Bridge": "hook", "X-MCP-Model": response.model}
     return JSONResponse(status_code=200, content=payload, headers=headers)
 # --------------------------
@@ -609,7 +636,11 @@ def _anthropic_to_chat_messages(messages: List[AnthropicMessage]) -> List[ChatMe
 @app.post("/v1/messages")
 async def anthropic_messages_endpoint(request: AnthropicMessagesRequest):
     # This endpoint mimics Anthropic Messages API using our MCP hook sampling
-    logger.info(f"Anthropic HTTP RX: {request.model_dump()}")
+    logger.info(rx_log(f"Anthropic HTTP RX: {request.model_dump()}"))
+
+    if request.stream and streaming_disabled():
+        logger.error("Anthropic streaming requested but disabled via MCPTB_ENABLE_STREAMING")
+        raise HTTPException(status_code=503, detail="Streaming disabled via MCPTB_ENABLE_STREAMING")
 
     # Check hook/session readiness
     if bridge.ctx is None:
@@ -626,13 +657,15 @@ async def anthropic_messages_endpoint(request: AnthropicMessagesRequest):
     chat_req = ChatCompletionRequest(model=request.model, messages=chat_messages, stream=False)
 
     # If streaming enabled via env, support stream / 若启用流式则支持 stream
-    if request.stream and not streaming_disabled():
+    if request.stream:
         out_queue: asyncio.Queue[StreamMsg] = asyncio.Queue(maxsize=1024)
         if bridge.stream_queue is None:
             raise HTTPException(status_code=503, detail="Hook not initialized - stream queue missing")
         await bridge.stream_queue.put((out_queue, chat_req))
         async def anthropic_stream():
             try:
+                logger.info(rx_log(f"Anthropic STREAM RX: model={request.model}, stream=True"))
+                fragments = 0
                 # Emit SSE events from out_queue fragments
 
                 # message_start
@@ -663,6 +696,7 @@ async def anthropic_messages_endpoint(request: AnthropicMessagesRequest):
                     msg = await out_queue.get()
                     if msg.msgFrag is None:
                         break
+                    fragments += 1
                     delta_event = {
                         "type": "content_block_delta",
                         "index": 0,
@@ -684,6 +718,7 @@ async def anthropic_messages_endpoint(request: AnthropicMessagesRequest):
 
                 # done
                 yield "data: [DONE]\n\n"
+                logger.info(tx_log(f"Anthropic STREAM TX: model={request.model}, chunks={fragments}, stream=True"))
             except Exception as exc:
                 logger.error(f"Anthropic streaming error: {exc}", exc_info=True)
                 err = {"error": {"message": str(exc), "type": type(exc).__name__}}
@@ -699,13 +734,16 @@ async def anthropic_messages_endpoint(request: AnthropicMessagesRequest):
             if bridge.stream_queue is None:
                 raise HTTPException(status_code=503, detail="Hook not initialized - stream queue missing")
             await bridge.stream_queue.put((out_queue, chat_req))
-            first = await out_queue.get()
-            _end = await out_queue.get()
-            text = first.msgFrag or ""
+            fragments: List[str] = []
+            while True:
+                msg = await out_queue.get()
+                if msg.msgFrag is None:
+                    break
+                fragments.append(msg.msgFrag)
+            text = "".join(fragments)
+            logger.info(f"[NON-STREAM-Q] Anthropic completed via queue: model={request.model}, chars={len(text)}")
         else:
             # Fallback to original non-stream
-            if request.stream and streaming_disabled():
-                logger.info("Anthropic stream requested but disabled via env; using non-stream response")
             completion = await bridge.submit_via_hook(chat_req)
             text = completion.choices[0].message.content if completion.choices else ""
         resp = {
@@ -814,6 +852,9 @@ def run_stdio_loop() -> None:
                 done, pending_tasks = await asyncio.wait({normal_task, stream_task}, return_when=asyncio.FIRST_COMPLETED)
                 for t in pending_tasks:
                     t.cancel()
+                for t in pending_tasks:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
                 task = next(iter(done))
                 item = task.result()
                 if isinstance(item, PendingTask):
@@ -829,13 +870,18 @@ def run_stdio_loop() -> None:
                     try:
                         text_result = await ctx.sample(messages=prompt, max_tokens=256)
                         full_text = getattr(text_result, "text", "") or ""
-                        if req.stream and not streaming_disabled():
-                            # Streaming: emit fragments
+                        if req.stream:
+                            # Streaming: emit fragments (currently char-based)
                             for ch in full_text:
                                 await out_queue.put(StreamMsg(msgFrag=ch))
                         else:
-                            # Non-stream: emit full then sentinel
+                            # Non-stream: emit full text (single message)
                             await out_queue.put(StreamMsg(msgFrag=full_text))
+                    except Exception as exc:
+                        logger.error(f"Hook streaming bridge error: {exc}", exc_info=True)
+                        # Emit placeholder so HTTP side can respond with empty text
+                        if not req.stream:
+                            await out_queue.put(StreamMsg(msgFrag=""))
                     finally:
                         await out_queue.put(StreamMsg(msgFrag=None))
             except Exception as exc:
