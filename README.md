@@ -68,12 +68,12 @@ flowchart LR
 ## Flow (English)
 1. HTTP `POST /v1/chat/completions` enqueues the request and waits for the `hook` worker reply.
 2. The `hook` tool never terminates; it runs on a fixed background thread and returns MCP headers along with the chat response.
-3. **Streaming disabled**: All `stream=true` requests are handled as non-stream JSON responses.
+3. **Streaming enabled**: `stream=true` requests push SSE chunks while the bridge aggregates the full answer for terminal TX logging.
 
 ## 工作流（中文）
 1. HTTP `POST /v1/chat/completions` 会将请求入队，等待 `hook` 工作者返回结果。
 2. `hook` 工具常驻后台线程，不会结束，同时返回 MCP 相关的响应头与聊天内容。
-3. **流式关闭**：所有 `stream=true` 请求均以非流式 JSON 响应返回。
+3. **流式开启**：`stream=true` 请求使用 SSE 按片段推送，桥接器会在日志中汇总完整内容。
 
 ## Project Layout / 目录结构
 - `mcptb.py` — single runtime module for both HTTP and MCP modes / 兼作 HTTP 与 MCP 入口的单文件模块
@@ -132,9 +132,9 @@ Place `mcp.json` under `.vscode/` (or your global MCP directory) so Copilot Chat
 
 ---
 
-## Important Note: Streaming Disabled / 重要说明：流式已禁用
-- All `stream=true` requests are handled as non-stream JSON responses.
-- 所有 `stream=true` 请求均按非流式 JSON 返回。
+## Streaming Support / 流式支持
+- **English**: `stream=true` returns Server-Sent Events (OpenAI-style `data:` lines or Anthropic message events). Each request is tagged with a GUID so RX/TX logs can be correlated. The hook emits fragments via per-request queues and the bridge logs the final assembled text when the stream ends.
+- **中文**：设置 `stream=true` 时返回 SSE（OpenAI 风格的 `data:` 行或 Anthropic 事件序列）。每个请求都有 GUID 方便在日志中对齐 RX/TX，hook 按队列输出片段，流结束时桥接器会记录完整文本。
 
 ## Endpoints & Examples / 接口与示例
 
@@ -149,6 +149,18 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+### OpenAI streaming / OpenAI 流式
+```bash
+curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Stream please"}],
+    "stream": true
+  }'
+# Receives SSE lines such as: data: {"choices":[{"delta":{"role":"assistant","content":"..."}}]}
+```
+
 ### Anthropic non-stream / Anthropic 非流式
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/messages \
@@ -158,6 +170,18 @@ curl -X POST http://127.0.0.1:8000/v1/messages \
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": false
   }'
+```
+
+### Anthropic streaming / Anthropic 流式
+```bash
+curl -N -X POST http://127.0.0.1:8000/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Stream please"}],
+    "stream": true
+  }'
+# Emits Anthropic event frames: message_start, content_block_delta, message_stop, [DONE]
 ```
 
 ## Timeouts / 超时
