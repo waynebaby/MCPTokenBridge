@@ -132,6 +132,24 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionStreamChoice]
 
 
+class ModelInfo(BaseModel):
+    """Minimal model metadata for listing.
+
+    模型枚举的最小元数据结构。保持与 OpenAI /v1/models 简单兼容。
+    """
+    id: str
+    object: str = Field("model", description="Item type")
+
+
+class ModelsListResponse(BaseModel):
+    """List response wrapper.
+
+    列表响应封装，模仿 OpenAI 的 `object: list` 与 `data` 数组。
+    """
+    object: str = Field("list", description="Response type")
+    data: List[ModelInfo]
+
+
 @dataclass
 class StreamMsg:
     """Streaming queue message: fragment text or sentinel.
@@ -192,7 +210,7 @@ class MCPTokenBridge:
     C# 背景的开发者理解。
     """
 
-    def __init__(self, model_name: str = "mcp-bridge-demo") -> None:
+    def __init__(self, model_name: str = "mcp-external-sampling") -> None:
         self.model_name = model_name
         # Direct sampling: store ctx when hook starts / 直接采样：在 hook 启动时保存 ctx
         self.ctx: Optional["Context"] = None
@@ -203,6 +221,78 @@ class MCPTokenBridge:
         self.stream_queue: Optional[asyncio.Queue[StreamBridgeTask]] = None
         # Track whether MCP session is ready / 跟踪 MCP 会话是否已准备好
         self.session_ready: bool = False
+
+    def _env_pref(self, name: str, default: float) -> float:
+        """Read preference weights from env.
+
+        从环境变量读取偏好值，范围 0-1；非法值时回退默认。
+        """
+        try:
+            v = float(os.getenv(name, str(default)))
+            if v < 0.0:
+                return 0.0
+            if v > 1.0:
+                return 1.0
+            return v
+        except Exception:
+            return default
+
+    def _max_tokens(self) -> int:
+        """Resolve max tokens from env or default.
+
+        从环境变量 `MCPTB_MAX_TOKENS` 解析最大 tokens；默认 327680.
+        """
+        v = os.getenv("MCPTB_MAX_TOKENS", "327680").strip()
+        try:
+            n = int(v)
+            return max(1, n)
+        except Exception:
+            return 327680
+
+    def _http_timeout(self, default: Optional[float] = 30.0) -> Optional[float]:
+        """Resolve per-request HTTP await timeout.
+
+        解析每次请求的等待超时（秒）。`MCPTB_HTTP_TIMEOUT` 支持：
+        - none / 0 / infinite / inf -> 无超时（返回 None）
+        - 其他数字字符串 -> 浮点秒数
+        如果未设置，则使用默认值（默认 30 秒）。
+        """
+        raw = os.getenv("MCPTB_HTTP_TIMEOUT", "").strip().lower()
+        if raw == "":
+            return default
+        if raw in {"none", "0", "infinite", "inf"}:
+            return None
+        try:
+            val = float(raw)
+            return None if val <= 0 else val
+        except Exception:
+            return default
+
+    def _build_structured_messages(self, req: ChatCompletionRequest) -> List[Dict[str, Any]]:
+        """Build MCP sampling messages payload per spec.
+
+        按 MCP 规范构建结构化消息：role + content(type=text,text)。
+        """
+        msgs: List[Dict[str, Any]] = []
+        for m in req.messages:
+            msgs.append({
+                "role": m.role,
+                "content": {"type": "text", "text": m.content},
+            })
+        return msgs
+
+    def _build_model_preferences(self, model_name: str) -> Dict[str, Any]:
+        """Compose `modelPreferences` per protocol fragments.
+
+        根据文档构造 modelPreferences：包含 hints 与三项优先级。
+        可通过环境变量调整：MCPTB_PREF_INTELLIGENCE/ SPEED/ COST。
+        """
+        return {
+            "hints": [{"name": model_name}] if model_name else [],
+            "intelligencePriority": self._env_pref("MCPTB_PREF_INTELLIGENCE", 0.5),
+            "speedPriority": self._env_pref("MCPTB_PREF_SPEED", 0.5),
+            "costPriority": self._env_pref("MCPTB_PREF_COST", 0.5),
+        }
 
     # Local generation removed; bridge requires MCP hook
     # 已移除本地生成；桥接器要求 MCP hook。
@@ -224,7 +314,25 @@ class MCPTokenBridge:
         prompt = "\n".join(parts) if parts else "Hello from MCPTokenBridge!"
         try:
             logger.debug(f"[{req_id}] Hook processing non-stream request: {prompt[:50]}...")
-            result = await self.ctx.sample(messages=prompt, max_tokens=256)
+            # Prefer structured MCP payload with modelPreferences; fallback progressively
+            structured = self._build_structured_messages(req)
+            prefs = self._build_model_preferences(req.model)
+            try:
+                result = await self.ctx.sample(
+                    messages=structured,
+                    max_tokens=self._max_tokens(),
+                    modelPreferences=prefs,
+                    systemPrompt=None,
+                )
+            except TypeError:
+                try:
+                    result = await self.ctx.sample(
+                        messages=prompt,
+                        max_tokens=self._max_tokens(),
+                        modelPreferences=prefs,
+                    )
+                except TypeError:
+                    result = await self.ctx.sample(messages=prompt, max_tokens=self._max_tokens())
             text = getattr(result, "text", "") or ""
             logger.debug(f"[{req_id}] Hook got response: {len(text)} chars")
             assistant_message = ChatMessage(role="assistant", content=text)
@@ -264,8 +372,25 @@ class MCPTokenBridge:
         try:
             logger.debug(f"[{req_id}] Hook processing stream request: {prompt[:50]}...")
             # Use regular sampling (not streaming) to get the full response
-            # VS Code Copilot may not support streaming sampling at MCP level
-            result = await self.ctx.sample(messages=prompt, max_tokens=256)
+            # Try structured payload with modelPreferences, then fallback
+            structured = self._build_structured_messages(req)
+            prefs = self._build_model_preferences(req.model)
+            try:
+                result = await self.ctx.sample(
+                    messages=structured,
+                    max_tokens=self._max_tokens(),
+                    modelPreferences=prefs,
+                    systemPrompt=None,
+                )
+            except TypeError:
+                try:
+                    result = await self.ctx.sample(
+                        messages=prompt,
+                        max_tokens=self._max_tokens(),
+                        modelPreferences=prefs,
+                    )
+                except TypeError:
+                    result = await self.ctx.sample(messages=prompt, max_tokens=self._max_tokens())
             text = getattr(result, "text", "") or ""
             logger.debug(f"[{req_id}] Hook got streaming response: {len(text)} chars")
             # Return full text; HTTP layer will split into streaming chunks
@@ -299,7 +424,11 @@ class MCPTokenBridge:
         asyncio.run_coroutine_threadsafe(self.queue.put(pending), self.hook_loop)
         # Await completion by awaiting the hook future via the hook loop
         wrapped = asyncio.run_coroutine_threadsafe(self._await_future(fut), self.hook_loop)
-        return await asyncio.wait_for(asyncio.wrap_future(wrapped), timeout=30.0)
+        # Apply configurable HTTP timeout; None means no timeout
+        timeout = self._http_timeout(default=30.0)
+        if timeout is None:
+            return await asyncio.wrap_future(wrapped)
+        return await asyncio.wait_for(asyncio.wrap_future(wrapped), timeout=timeout)
 
     async def submit_via_hook_streaming(self, request: ChatCompletionRequest, request_id: str) -> str:
         """Submit a request to the MCP hook queue and await streaming result.
@@ -319,7 +448,10 @@ class MCPTokenBridge:
         asyncio.run_coroutine_threadsafe(self.queue.put(pending), self.hook_loop)
         # Await completion with timeout
         wrapped = asyncio.run_coroutine_threadsafe(self._await_future_streaming(fut), self.hook_loop)
-        return await asyncio.wait_for(asyncio.wrap_future(wrapped), timeout=30.0)
+        timeout = self._http_timeout(default=30.0)
+        if timeout is None:
+            return await asyncio.wrap_future(wrapped)
+        return await asyncio.wait_for(asyncio.wrap_future(wrapped), timeout=timeout)
 
     async def _await_future_streaming(self, fut: asyncio.Future) -> str:
         return await fut  # helper to await hook-side futures from HTTP loop (streaming)
@@ -635,6 +767,31 @@ async def chat_completions_endpoint(request: ChatCompletionRequest):
     logger.info(tx_log(f"[{request_id}] HTTP TX: {json.dumps(payload, ensure_ascii=False)}"))
     headers = {"X-MCP-Bridge": "hook", "X-MCP-Model": response.model}
     return JSONResponse(status_code=200, content=payload, headers=headers)
+
+
+@app.get("/v1/models")
+async def list_models_endpoint():
+    """Return available models (static list).
+
+    返回可用模型（静态列表）。目前 MCP/Copilot 不提供模型枚举，
+    因此仅返回桥接器的默认模型名；用于满足客户端预期的列表接口。
+    """
+    request_id = str(uuid.uuid4())
+    logger.info(rx_log(f"[{request_id}] HTTP RX: GET /v1/models"))
+
+    # Current design: single effective model, mapped from 'auto' by HTTP layer.
+    models = [ModelInfo(id=bridge.model_name)]
+    resp = ModelsListResponse(data=models)
+
+    # Headers provide bridge/session hints for clients.
+    headers = {
+        "X-MCP-Bridge": "hook",
+        "X-MCP-Models-Count": str(len(models)),
+        "X-MCP-Session-Ready": "true" if bridge.session_ready else "false",
+    }
+    payload = resp.model_dump()
+    logger.info(tx_log(f"[{request_id}] HTTP TX: {json.dumps(payload, ensure_ascii=False)}"))
+    return JSONResponse(status_code=200, content=payload, headers=headers)
 # --------------------------
 # Anthropic /v1/messages shim
 # --------------------------
@@ -864,6 +1021,7 @@ def run_stdio_loop() -> None:
         for attempt in range(1, 31):  # Try up to 30 times
             try:
                 logger.info(f"Session warm-up attempt {attempt}/30...")
+                # Warm-up without model preference to avoid signature mismatch
                 _ = await ctx.sample(messages="warmup", max_tokens=1)
                 logger.info("✓ FastMCP session warm-up complete - ready for requests")
                 session_established = True
@@ -914,7 +1072,25 @@ def run_stdio_loop() -> None:
                     prompt = "\n".join(parts) if parts else "Hello from MCPTokenBridge!"
                     try:
                         logger.debug(f"[{req_id}] Hook bridge processing stream queue request: model={req.model}")
-                        text_result = await ctx.sample(messages=prompt, max_tokens=256)
+                        # Prefer structured MCP payload with modelPreferences; fallback progressively
+                        structured = bridge._build_structured_messages(req)
+                        prefs = bridge._build_model_preferences(req.model)
+                        try:
+                            text_result = await ctx.sample(
+                                messages=structured,
+                                max_tokens=bridge._max_tokens(),
+                                modelPreferences=prefs,
+                                systemPrompt=None,
+                            )
+                        except TypeError:
+                            try:
+                                text_result = await ctx.sample(
+                                    messages=prompt,
+                                    max_tokens=bridge._max_tokens(),
+                                    modelPreferences=prefs,
+                                )
+                            except TypeError:
+                                text_result = await ctx.sample(messages=prompt, max_tokens=bridge._max_tokens())
                         full_text = getattr(text_result, "text", "") or ""
                         if req.stream:
                             # Streaming: emit fragments (currently char-based)
@@ -959,7 +1135,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         help=(
             "HTTP bind address; use 0.0.0.0 to expose all adapters or a specific IP "
             "(e.g., 192.168.55.10) to limit access / HTTP 绑定地址；使用 0.0.0.0 暴露"
-            "全部网卡，指定具体 IP（如 192.168.55.10）可限制访问。"
+            "全部网卡，指定具体 IP（如 192.168.55.10）可限制访问。" 
         ),
     )
     parser.add_argument("--port", type=int, default=8000, help="HTTP port")
@@ -977,6 +1153,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         access_log=False,
         log_level="warning",
         use_colors=False,
+        ws="none",  # Disable WebSocket support to avoid legacy websockets warnings
     )
     server = uvicorn.Server(server_config)
 

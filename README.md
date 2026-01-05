@@ -79,6 +79,42 @@ curl -X POST http://127.0.0.1:8000/v1/messages -H "Content-Type: application/jso
 curl -N -X POST http://127.0.0.1:8000/v1/messages -H "Content-Type: application/json" -d '{"model":"auto","messages":[{"role":"user","content":"Stream"}],"stream":true}'
 ```
 
+Models endpoint:
+```bash
+# Returns a simple OpenAI-style list of available models
+curl http://127.0.0.1:8000/v1/models
+```
+Notes:
+- The bridge currently exposes a single effective model. This endpoint exists for client compatibility.
+- Actual model selection is performed by the MCP client via preferences; see below.
+
+Model preferences:
+- The bridge forwards model selection via MCP `modelPreferences` with a hint from the HTTP `model` field.
+- You can tune capability priorities via environment variables (0–1):
+  - `MCPTB_PREF_INTELLIGENCE`: favor capability
+  - `MCPTB_PREF_SPEED`: favor latency
+  - `MCPTB_PREF_COST`: favor price
+Example:
+```bash
+$env:MCPTB_PREF_INTELLIGENCE = "0.8"
+$env:MCPTB_PREF_SPEED = "0.5"
+$env:MCPTB_PREF_COST = "0.3"
+```
+
+Tokens and timeouts:
+- Max tokens forwarded to MCP sampling can be configured:
+  - `MCPTB_MAX_TOKENS` (default: 327680)
+- HTTP await timeout for hook completion:
+  - `MCPTB_HTTP_TIMEOUT` (seconds, or `none`/`0`/`infinite`/`inf` to disable)
+Example:
+```bash
+$env:MCPTB_MAX_TOKENS = "327680"
+$env:MCPTB_HTTP_TIMEOUT = "none"
+```
+
+Limits:
+- Actual generated length may be capped by the client‑selected model’s maximum context window and provider policies. The bridge forwards preferences and `max_tokens`, but final selection and enforcement is done by the MCP client and its provider.
+
 MCP setup:
 ```json
 {
@@ -88,6 +124,27 @@ MCP setup:
       "command": "python",
       "args": ["mcptb.py", "--host", "0.0.0.0", "--port", "8000"],
       "env": {"MCPTB_HTTP_TIMEOUT": "none"}
+    }
+  }
+}
+```
+
+Advanced MCP config (env examples):
+```json
+{
+  "mcpServers": {
+    "MCPTokenBridge": {
+      "transport": {"type": "stdio"},
+      "command": "python",
+      "args": ["mcptb.py", "--host", "0.0.0.0", "--port", "8000"],
+      "env": {
+        "MCPTB_HTTP_TIMEOUT": "none",
+        "MCPTB_MAX_TOKENS": "327680",
+        "MCPTB_PREF_INTELLIGENCE": "0.8",
+        "MCPTB_PREF_SPEED": "0.5",
+        "MCPTB_PREF_COST": "0.3",
+        "MCPTB_FORCE_COLOR": "1"
+      }
     }
   }
 }
@@ -188,6 +245,41 @@ curl -X POST http://127.0.0.1:8000/v1/messages -H "Content-Type: application/jso
 curl -N -X POST http://127.0.0.1:8000/v1/messages -H "Content-Type: application/json" -d '{"model":"auto","messages":[{"role":"user","content":"Stream"}],"stream":true}'
 ```
 
+模型列表接口：
+```bash
+# 返回 OpenAI 风格的模型列表（兼容用）
+curl http://127.0.0.1:8000/v1/models
+```
+说明：
+- 当前桥接器仅暴露一个有效模型；此接口用于满足客户端的模型枚举需求。
+- 实际模型选择由 MCP 客户端根据偏好完成，见下文。
+
+模型偏好：
+- 桥接器把 HTTP 请求体中的 `model` 作为 MCP `modelPreferences.hints` 传递，并可配置三项优先级：
+  - `MCPTB_PREF_INTELLIGENCE`：能力优先（0–1）
+  - `MCPTB_PREF_SPEED`：时延优先（0–1）
+  - `MCPTB_PREF_COST`：成本优先（0–1）
+示例：
+```bash
+$env:MCPTB_PREF_INTELLIGENCE = "0.8"
+$env:MCPTB_PREF_SPEED = "0.5"
+$env:MCPTB_PREF_COST = "0.3"
+```
+
+Tokens 与超时：
+- 采样的最大 tokens：
+  - `MCPTB_MAX_TOKENS`（默认：327680）
+- HTTP 等待超时（秒），可关闭：
+  - `MCPTB_HTTP_TIMEOUT`（数值或 `none`/`0`/`infinite`/`inf`）
+示例：
+```bash
+$env:MCPTB_MAX_TOKENS = "327680"
+$env:MCPTB_HTTP_TIMEOUT = "none"
+```
+
+限制说明：
+- 最终生成长度受客户端所选模型的最大上下文窗口以及提供方策略限制。桥接器会传递偏好与 `max_tokens`，但实际选择与限制由 MCP 客户端及其提供方决定。
+
 MCP 配置：
 ```json
 {
@@ -197,6 +289,27 @@ MCP 配置：
       "command": "python",
       "args": ["mcptb.py", "--host", "0.0.0.0", "--port", "8000"],
       "env": {"MCPTB_HTTP_TIMEOUT": "none"}
+    }
+  }
+}
+```
+
+高级 MCP 配置（env 示例）：
+```json
+{
+  "mcpServers": {
+    "MCPTokenBridge": {
+      "transport": {"type": "stdio"},
+      "command": "python",
+      "args": ["mcptb.py", "--host", "0.0.0.0", "--port", "8000"],
+      "env": {
+        "MCPTB_HTTP_TIMEOUT": "none",
+        "MCPTB_MAX_TOKENS": "327680",
+        "MCPTB_PREF_INTELLIGENCE": "0.8",
+        "MCPTB_PREF_SPEED": "0.5",
+        "MCPTB_PREF_COST": "0.3",
+        "MCPTB_FORCE_COLOR": "1"
+      }
     }
   }
 }
